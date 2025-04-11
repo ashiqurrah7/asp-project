@@ -1,253 +1,175 @@
-#include "utils.h"
+/* w25clients.c – Client Program for Distributed File System */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
-#define S1_HOST "127.0.0.1"
-#define S1_PORT 5001
+#define PORT_S1 5000
+#define BUFFER_SIZE 1024
 
-int main() {
-  int socketfd = socket(AF_INET, SOCK_STREAM, 0);
-  struct sockaddr_in servAdd;
-  socklen_t len;
-
-  if (socketfd < 0) {
-    perror("Socket error");
-    exit(1);
-  }
-
-  servAdd.sin_family = AF_INET;
-  servAdd.sin_port = htons((uint16_t)S1_PORT);
-
-  if (inet_pton(AF_INET, S1_HOST, &servAdd.sin_addr) < 0) {
-    fprintf(stderr, " inet_pton() has failed\n");
-    exit(2);
-  }
-
-  if (connect(socketfd, (struct sockaddr *)&servAdd, sizeof(servAdd)) < 0) {
-    fprintf(stderr, "connect() failed, exiting\n");
-    exit(3);
-  }
-
-  printf("Connected to S1 at %s:%d\n", S1_HOST, S1_PORT);
-
-  while (1) {
-    printf("\nw25clients> ");
-    fflush(stdout);
-
-    char line[1024];
-
-    if (!fgets(line, sizeof(line), stdin))
-      break;
-
-    char *command = strtok(line, " \t\r\n");
-    if (!command)
-      continue;
-
-    if (strcmp(command, "uploadf") == 0) {
-      // parse filename, dest
-      char *filename = strtok(NULL, " \t\r\n");
-      char *dest = strtok(NULL, " \t\r\n");
-      if (!filename || !dest) {
-        printf("uploadf needs a filename and a destination path\n");
-        continue;
-      }
-      // send "uploadf filename dest"
-      // since we need to send the command along with the file to s1,
-      // we do send_string: "uploadf filename dest"
-      // and S1 will parse it, then expect file data
-      char combined[1024];
-      snprintf(combined, sizeof(combined), "uploadf %s %s", filename, dest);
-      send_string(socketfd, combined);
-
-      // read local file
-      // using fopen because we don't have to specify a file size
-      FILE *fp = fopen(filename, "rb");
-      if (!fp) {
-        // we still need to send 0 bytes to s1 since s1 needs to know something
-        // went wrong and doesn't expect the file
-        send_string(socketfd, "0");
-        printf("Cannot open local file.\n");
-        continue;
-      }
-      // using fseek and ftell to get file size instead of lseek because of the
-      // use of fopen instead of open
-      fseek(fp, 0, SEEK_END);
-      long sz = ftell(fp);
-      fseek(fp, 0, SEEK_SET);
-
-      char szbuf[64];
-      sprintf(szbuf, "%ld", sz);
-      send_string(socketfd, szbuf);
-
-      char buf[4096];
-      while (!feof(fp)) {
-        size_t file_size = fread(buf, 1, 4096, fp);
-        if (file_size > 0) {
-          if (send_all(socketfd, buf, file_size) < 0) {
-            printf("Send error\n");
-            break;
-          }
-        }
-      }
-      fclose(fp);
-      printf("Uploaded %s to %s\n", filename, dest);
-    } else if (strcmp(command, "downlf") == 0) {
-      // parse file path
-      char *remotePath = strtok(NULL, " \t\r\n");
-      if (!remotePath) {
-        printf("downlf needs a file path\n");
-        continue;
-      }
-      // send command
-      char combined[1024];
-      snprintf(combined, sizeof(combined), "downlf %s", remotePath);
-      send_string(socketfd, combined);
-
-      // S1 will respond with size, then data
-      char *sizestr = recv_string(socketfd);
-      if (!sizestr) {
-        printf("downlf: no size\n");
-        continue;
-      }
-      long sz = atol(sizestr);
-      free(sizestr);
-      if (sz <= 0) {
-        printf("File not found or zero length.\n");
-        continue;
-      }
-      // extract the filename from remotePath
-      char *slash = strrchr(remotePath, '/');
-      const char *fname = slash ? slash + 1 : remotePath;
-
-      FILE *fp = fopen(fname, "wb");
-      if (!fp) {
-        printf("Cannot create local file %s\n", fname);
-        // even if file cannot be created, data from S1 must be read and
-        // discarded so that the communication channel is clear for future
-        // operations
-        long left = sz;
-        char tmp[4096];
-        while (left > 0) {
-          // reading in chunks reduces the number of i/o operations
-          long chunk = (left > 4096) ? 4096 : left;
-          if (recv_all(socketfd, tmp, chunk) < 0)
-            break;
-          left -= chunk;
-        }
-        continue;
-      }
-      // get actual file if file can be created
-      long left = sz;
-      char buf[4096];
-      while (left > 0) {
-        long chunk = (left > 4096) ? 4096 : left;
-        if (recv_all(socketfd, buf, chunk) < 0) {
-          break;
-        }
-        // writing to file in chunks
-        fwrite(buf, 1, chunk, fp);
-        left -= chunk;
-      }
-      fclose(fp);
-      printf("Downloaded %s (%ld bytes)\n", fname, sz);
-    } else if (strcmp(command, "removef") == 0) {
-      char *remotePath = strtok(NULL, " \t\r\n");
-      if (!remotePath) {
-        printf("removef needs file path\n");
-        continue;
-      }
-      char combined[1024];
-      snprintf(combined, sizeof(combined), "removef %s", remotePath);
-      send_string(socketfd, combined);
-      printf("Removing file %s\n", remotePath);
-
-    } else if (strcmp(command, "downltar") == 0) {
-      // extract file type
-      char *ft = strtok(NULL, " \t\r\n");
-      if (!ft) {
-        printf("downltar needs file type .c|.txt|.pdf (no zips) \n");
-        continue;
-      }
-      char combined[1024];
-      snprintf(combined, sizeof(combined), "downltar %s", ft);
-      send_string(socketfd, combined);
-
-      // will return 0 if no files of type ft are available
-      char *sizestr = recv_string(socketfd);
-      if (!sizestr) {
-        printf("No size returned.\n");
-        continue;
-      }
-      long sz = atol(sizestr);
-      free(sizestr);
-      if (sz <= 0) {
-        printf("No available files of type %s to archive.\n", ft);
-        continue;
-      }
-
-      // decide local name
-      char localfn[50];
-      if (strcmp(ft, ".c") == 0)
-        strcpy(localfn, "cfiles.tar");
-      else if (strcmp(ft, ".pdf") == 0)
-        strcpy(localfn, "pdf.tar");
-      else if (strcmp(ft, ".txt") == 0)
-        strcpy(localfn, "text.tar");
-      else {
-        printf("File type %s not supported for archiving\n", ft);
-        continue;
-      }
-
-      FILE *fp = fopen(localfn, "wb");
-      if (!fp) {
-        printf("Cannot create %s\n", localfn);
-        // discard data
-        while (sz > 0) {
-          long chunk = (sz > 4096) ? 4096 : sz;
-          char tmp[4096];
-          if (recv_all(socketfd, tmp, chunk) < 0)
-            break;
-          sz -= chunk;
-        }
-        continue;
-      }
-
-      // getting archive from S1
-      while (sz > 0) {
-        long chunk = (sz > 4096) ? 4096 : sz;
-        char tmp[4096];
-        if (recv_all(socketfd, tmp, chunk) < 0)
-          break;
-        fwrite(tmp, 1, chunk, fp);
-        sz -= chunk;
-      }
-      fclose(fp);
-      printf("Received %s\n", localfn);
-
-    } else if (strcmp(command, "dispfnames") == 0) {
-      char *p = strtok(NULL, " \t\r\n");
-      if (!p) {
-        printf("dispfnames needs pathname\n");
-        continue;
-      }
-      char combined[1024];
-      snprintf(combined, sizeof(combined), "dispfnames %s", p);
-      send_string(socketfd, combined);
-
-      // read list
-      char *listing = recv_string(socketfd);
-      if (!listing) {
-        printf("No listing.\n");
-        continue;
-      }
-      printf("Files:\n%s", listing);
-      free(listing);
-    } else if (strcmp(command, "exit") == 0) {
-      // exit out of program
-      break;
-    } else {
-      printf("Unrecognized command %s\n", command);
-      continue;
+// Connect to S1 server on port 5000
+int connect_to_S1() {
+    int sockfd;
+    struct sockaddr_in serv_addr;
+    if((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("Socket creation error");
+        return -1;
     }
-  }
-  close(socketfd);
-  return 0;
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(PORT_S1);
+    serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        perror("Connection error");
+        close(sockfd);
+        return -1;
+    }
+    return sockfd;
+}
+
+// Send file data over the socket
+int send_file(int sock, const char *filepath) {
+    FILE *fp = fopen(filepath, "rb");
+    if(fp == NULL) {
+        perror("File open error");
+        return -1;
+    }
+    char buffer[BUFFER_SIZE];
+    int n;
+    while((n = fread(buffer, sizeof(char), BUFFER_SIZE, fp)) > 0) {
+        send(sock, buffer, n, 0);
+    }
+    fclose(fp);
+    return 0;
+}
+
+// Receive file data from socket and save it locally
+int receive_file(int sock, const char *filepath, long filesize) {
+    FILE *fp = fopen(filepath, "wb");
+    if(fp == NULL) {
+        perror("File open error");
+        return -1;
+    }
+    char buffer[BUFFER_SIZE];
+    long remaining = filesize;
+    while(remaining > 0) {
+        int n = recv(sock, buffer, (remaining > BUFFER_SIZE ? BUFFER_SIZE : remaining), 0);
+        if(n <= 0) break;
+        fwrite(buffer, sizeof(char), n, fp);
+        remaining -= n;
+    }
+    fclose(fp);
+    return 0;
+}
+int main() {
+    char command[BUFFER_SIZE];
+    while(1) {
+        printf("w25clients$ ");
+        fflush(stdout);
+        if(!fgets(command, sizeof(command), stdin))
+            break;
+        command[strcspn(command, "\r\n")] = 0;
+        if(strlen(command) == 0) continue;
+        
+        if(strncmp(command, "uploadf", 7) == 0) {
+            char filename[256], dest_path[256];
+            sscanf(command, "uploadf %s %s", filename, dest_path);
+            FILE *fp = fopen(filename, "rb");
+            if(fp == NULL) {
+                printf("File %s not found in current directory.\n", filename);
+                continue;
+            }
+            fseek(fp, 0, SEEK_END);
+            long fsize = ftell(fp);
+            fclose(fp);
+            int sock = connect_to_S1();
+            if(sock < 0) continue;
+            // Send command, then file size, then file data
+            send(sock, command, strlen(command), 0);
+            sleep(1);
+            char fsizeStr[64];
+            snprintf(fsizeStr, sizeof(fsizeStr), "%ld", fsize);
+            send(sock, fsizeStr, strlen(fsizeStr), 0);
+            sleep(1);
+            send_file(sock, filename);
+            char response[BUFFER_SIZE];
+            int n = recv(sock, response, sizeof(response)-1, 0);
+            if(n > 0) {
+                response[n] = '\0';
+                printf("%s", response);
+            }
+            close(sock);
+        } else if(strncmp(command, "downlf", 6) == 0) {
+            char filepath[256];
+            sscanf(command, "downlf %s", filepath);
+            int sock = connect_to_S1();
+            if(sock < 0) continue;
+            send(sock, command, strlen(command), 0);
+            char fsizeStr[64];
+            int n = recv(sock, fsizeStr, sizeof(fsizeStr)-1, 0);
+            if(n <= 0) {
+                printf("Error receiving file size.\n");
+                close(sock);
+                continue;
+            }
+            fsizeStr[n] = '\0';
+            long fsize = atol(fsizeStr);
+            // Determine local filename from filepath
+            char *token = strrchr(filepath, '/');
+            char local_filename[256];
+            if(token)
+                strcpy(local_filename, token+1);
+            else
+                strcpy(local_filename, filepath);
+            receive_file(sock, local_filename, fsize);
+            printf("File %s downloaded.\n", local_filename);
+            close(sock);
+        } else if(strncmp(command, "removef", 7) == 0) {
+            int sock = connect_to_S1();
+            if(sock < 0) continue;
+            send(sock, command, strlen(command), 0);
+            char response[BUFFER_SIZE];
+            int n = recv(sock, response, sizeof(response)-1, 0);
+            if(n > 0) {
+                response[n] = '\0';
+                printf("%s", response);
+            }
+            close(sock);
+        } else if(strncmp(command, "downltar", 8) == 0) {
+            int sock = connect_to_S1();
+            if(sock < 0) continue;
+            send(sock, command, strlen(command), 0);
+            char fsizeStr[64];
+            int n = recv(sock, fsizeStr, sizeof(fsizeStr)-1, 0);
+            if(n <= 0) {
+                printf("Error receiving tar file size.\n");
+                close(sock);
+                continue;
+            }
+            fsizeStr[n] = '\0';
+            long fsize = atol(fsizeStr);
+            char tar_filename[256] = "downloaded.tar";
+            receive_file(sock, tar_filename, fsize);
+            printf("Tar file %s downloaded.\n", tar_filename);
+            close(sock);
+        } else if(strncmp(command, "dispfnames", 10) == 0) {
+            int sock = connect_to_S1();
+            if(sock < 0) continue;
+            send(sock, command, strlen(command), 0);
+            char listBuffer[4096];
+            int n = recv(sock, listBuffer, sizeof(listBuffer)-1, 0);
+            if(n > 0) {
+                listBuffer[n] = '\0';
+                printf("Files:\n%s", listBuffer);
+            }
+            close(sock);
+        } else {
+            printf("Invalid command.\n");
+        }
+    }
+    return 0;
 }
