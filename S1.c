@@ -12,10 +12,10 @@
 #include <errno.h>
 #include <sys/wait.h>
 
-#define PORT_S1 5000
-#define PORT_S2 5001
-#define PORT_S3 5002
-#define PORT_S4 5003
+#define PORT_S1 9000
+#define PORT_S2 9001
+#define PORT_S3 9002
+#define PORT_S4 9003
 #define BUFFER_SIZE 1024
 
 // Function prototypes

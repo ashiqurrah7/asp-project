@@ -9,7 +9,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#define PORT_S1 5000
+#define PORT_S1 9000
 #define BUFFER_SIZE 1024
 
 // Connect to S1 server on port 5000

@@ -11,7 +11,7 @@
 #include <dirent.h>
 #include <errno.h>
 
-#define PORT_S3 5002
+#define PORT_S3 9002
 #define BUFFER_SIZE 1024
 
 void create_directory_if_not_exists(const char *path) {
