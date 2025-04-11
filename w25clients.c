@@ -67,7 +67,8 @@ int main() {
         printf("Cannot open local file.\n");
         continue;
       }
-      // using fseek and ftell to get file size instead of lseek because of the use of fopen instead of open
+      // using fseek and ftell to get file size instead of lseek because of the
+      // use of fopen instead of open
       fseek(fp, 0, SEEK_END);
       long sz = ftell(fp);
       fseek(fp, 0, SEEK_SET);
@@ -89,14 +90,164 @@ int main() {
       fclose(fp);
       printf("Uploaded %s to %s\n", filename, dest);
     } else if (strcmp(command, "downlf") == 0) {
+      // parse file path
+      char *remotePath = strtok(NULL, " \t\r\n");
+      if (!remotePath) {
+        printf("downlf needs a file path\n");
+        continue;
+      }
+      // send command
+      char combined[1024];
+      snprintf(combined, sizeof(combined), "downlf %s", remotePath);
+      send_string(socketfd, combined);
 
+      // S1 will respond with size, then data
+      char *sizestr = recv_string(socketfd);
+      if (!sizestr) {
+        printf("downlf: no size\n");
+        continue;
+      }
+      long sz = atol(sizestr);
+      free(sizestr);
+      if (sz <= 0) {
+        printf("File not found or zero length.\n");
+        continue;
+      }
+      // extract the filename from remotePath
+      char *slash = strrchr(remotePath, '/');
+      const char *fname = slash ? slash + 1 : remotePath;
+
+      FILE *fp = fopen(fname, "wb");
+      if (!fp) {
+        printf("Cannot create local file %s\n", fname);
+        // even if file cannot be created, data from S1 must be read and
+        // discarded so that the communication channel is clear for future
+        // operations
+        long left = sz;
+        char tmp[4096];
+        while (left > 0) {
+          // reading in chunks reduces the number of i/o operations
+          long chunk = (left > 4096) ? 4096 : left;
+          if (recv_all(socketfd, tmp, chunk) < 0)
+            break;
+          left -= chunk;
+        }
+        continue;
+      }
+      // get actual file if file can be created
+      long left = sz;
+      char buf[4096];
+      while (left > 0) {
+        long chunk = (left > 4096) ? 4096 : left;
+        if (recv_all(socketfd, buf, chunk) < 0) {
+          break;
+        }
+        // writing to file in chunks
+        fwrite(buf, 1, chunk, fp);
+        left -= chunk;
+      }
+      fclose(fp);
+      printf("Downloaded %s (%ld bytes)\n", fname, sz);
     } else if (strcmp(command, "removef") == 0) {
+      char *remotePath = strtok(NULL, " \t\r\n");
+      if (!remotePath) {
+        printf("removef needs file path\n");
+        continue;
+      }
+      char combined[1024];
+      snprintf(combined, sizeof(combined), "removef %s", remotePath);
+      send_string(socketfd, combined);
+      printf("Removing file %s\n", remotePath);
 
     } else if (strcmp(command, "downltar") == 0) {
+      // extract file type
+      char *ft = strtok(NULL, " \t\r\n");
+      if (!ft) {
+        printf("downltar needs file type .c|.txt|.pdf (no zips) \n");
+        continue;
+      }
+      char combined[1024];
+      snprintf(combined, sizeof(combined), "downltar %s", ft);
+      send_string(socketfd, combined);
+
+      // will return 0 if no files of type ft are available
+      char *sizestr = recv_string(socketfd);
+      if (!sizestr) {
+        printf("No size returned.\n");
+        continue;
+      }
+      long sz = atol(sizestr);
+      free(sizestr);
+      if (sz <= 0) {
+        printf("No available files of type %s to archive.\n", ft);
+        continue;
+      }
+
+      // decide local name
+      char localfn[50];
+      if (strcmp(ft, ".c") == 0)
+        strcpy(localfn, "cfiles.tar");
+      else if (strcmp(ft, ".pdf") == 0)
+        strcpy(localfn, "pdf.tar");
+      else if (strcmp(ft, ".txt") == 0)
+        strcpy(localfn, "text.tar");
+      else {
+        printf("File type %s not supported for archiving\n", ft);
+        continue;
+      }
+
+      FILE *fp = fopen(localfn, "wb");
+      if (!fp) {
+        printf("Cannot create %s\n", localfn);
+        // discard data
+        while (sz > 0) {
+          long chunk = (sz > 4096) ? 4096 : sz;
+          char tmp[4096];
+          if (recv_all(socketfd, tmp, chunk) < 0)
+            break;
+          sz -= chunk;
+        }
+        continue;
+      }
+
+      // getting archive from S1
+      while (sz > 0) {
+        long chunk = (sz > 4096) ? 4096 : sz;
+        char tmp[4096];
+        if (recv_all(socketfd, tmp, chunk) < 0)
+          break;
+        fwrite(tmp, 1, chunk, fp);
+        sz -= chunk;
+      }
+      fclose(fp);
+      printf("Received %s\n", localfn);
 
     } else if (strcmp(command, "dispfnames") == 0) {
+      char *p = strtok(NULL, " \t\r\n");
+      if (!p) {
+        printf("dispfnames needs pathname\n");
+        continue;
+      }
+      char combined[1024];
+      snprintf(combined, sizeof(combined), "dispfnames %s", p);
+      send_string(socketfd, combined);
+
+      // read list
+      char *listing = recv_string(socketfd);
+      if (!listing) {
+        printf("No listing.\n");
+        continue;
+      }
+      printf("Files:\n%s", listing);
+      free(listing);
+    } else if (strcmp(command, "exit") == 0) {
+      // exit out of program
+      break;
+    } else {
+      printf("Unrecognized command %s\n", command);
+      continue;
     }
   }
-
+  close(socketfd);
   return 0;
 }
