@@ -11,17 +11,18 @@
 #define S3_PORT 6003
 #define S4_HOST "127.0.0.1"
 #define S4_PORT 6004
+#define CHUNK 4096
 
 #define S1_FOLDER "S1" // local storage for .c
 
 int connect_to(const char *host, int port);
 
-void prcclient(int cfd);
-void uploadf(int cfd, char *filename, char *dest);
-void downlf(int cfd, char *path);
-void removef(int cfd, char *path);
-void downltar(int cfd, char *filetype);
-void dispfnames(int cfd, char *path);
+void prcclient(int connfd);
+void uploadf(int connfd, char *filename, char *dest);
+void downlf(int connfd, char *path);
+void removef(int connfd, char *path);
+void downltar(int connfd, char *filetype);
+void dispfnames(int connfd, char *path);
 
 const char *get_file_extension(const char *filename) {
   const char *dot = strrchr(filename, '.');
@@ -33,6 +34,7 @@ int main() {
 
   int socketfd, con_sd;
   struct sockaddr_in servAdd;
+  memset(&servAdd, 0, sizeof(servAdd));
   socketfd = socket(AF_INET, SOCK_STREAM, 0);
 
   if (socketfd < 0) {
@@ -76,12 +78,12 @@ int main() {
   return 0;
 }
 
-// prcclient: infinite loop reading commands from w25clients
-void prcclient(int cfd) {
+// infinite loop reading commands from client and runs functions accordingly
+void prcclient(int connfd) {
   while (1) {
-    char *cmdline = recv_string(cfd);
+    char *cmdline = recv_string(connfd);
     if (!cmdline) {
-      // client disconnected or error
+      // break out of loop if client disconnected or if socket error occurs
       break;
     }
     // parse command
@@ -95,49 +97,52 @@ void prcclient(int cfd) {
       char *filename = strtok(NULL, " ");
       char *dest = strtok(NULL, " ");
       if (filename && dest) {
-        uploadf(cfd, filename, dest);
+        uploadf(connfd, filename, dest);
       }
     } else if (strcmp(tok, "downlf") == 0) {
       char *path = strtok(NULL, " ");
       if (path) {
-        downlf(cfd, path);
+        downlf(connfd, path);
       }
     } else if (strcmp(tok, "removef") == 0) {
       char *path = strtok(NULL, " ");
       if (path) {
-        removef(cfd, path);
+        removef(connfd, path);
       }
     } else if (strcmp(tok, "downltar") == 0) {
       char *ft = strtok(NULL, " ");
       if (ft) {
-        downltar(cfd, ft);
+        downltar(connfd, ft);
       }
     } else if (strcmp(tok, "dispfnames") == 0) {
       char *p = strtok(NULL, " ");
       if (p) {
-        dispfnames(cfd, p);
+        dispfnames(connfd, p);
       }
     }
 
     free(cmdline);
   }
 }
-// 1) uploadf
-void uploadf(int cfd, char *filename, char *dest) {
-  // 1) read the file size from client
-  char *sz_s = recv_string(cfd);
+
+// upload file to server
+void uploadf(int connfd, char *filename, char *dest) {
+  // read the file size from client in string format
+  char *sz_s = recv_string(connfd);
   if (!sz_s)
     return;
   long fsize = atol(sz_s);
   free(sz_s);
 
+  // read and discard data incase of incorrect file size
+  // data still needs to be read from socket to keep it open for
+  // any upcomming connections
   if (fsize <= 0) {
-    // discard incoming data
     char discard[1024];
     long remain = fsize;
     while (remain > 0) {
       long chunk = (remain > 1024) ? 1024 : remain;
-      if (recv_all(cfd, discard, chunk) < 0)
+      if (recv_all(connfd, discard, chunk) < 0)
         break;
       remain -= chunk;
     }
@@ -145,41 +150,52 @@ void uploadf(int cfd, char *filename, char *dest) {
     return;
   }
 
-  // 2) Save the incoming data into a temporary file: "<basename>.tmp"
-  //    e.g. if local user file is "/home/rohan/.../hello.c", parse out
-  //    "hello.c"
+  // Save the incoming data into a temporary file: "<basename>.tmp"
+  // basename being the filename
+  // this is done so absolute paths can be used and it would not create
+  // the directories mentioned in the file path
+  // e.g. if local user file is "/home/rohan/.../hello.c", parse out
+  // "hello.c"
+  // done  by finding last instance of / character, and taking everything after
+  // that
   char *slashPos = strrchr(filename, '/');
   const char *baseName = (slashPos) ? slashPos + 1 : filename;
-  // e.g. baseName = "hello.c"
 
   char tmp_path[256];
   snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", baseName);
 
   FILE *fp = fopen(tmp_path, "wb");
+  // if there is an error creating the file, then read and discard data from
+  // socket
   if (!fp) {
     perror("[S1] fopen tmp");
-    // discard data
     char discard[1024];
     long remain = fsize;
     while (remain > 0) {
       long chunk = (remain > 1024) ? 1024 : remain;
-      if (recv_all(cfd, discard, chunk) < 0)
+      if (recv_all(connfd, discard, chunk) < 0)
         break;
       remain -= chunk;
     }
     return;
   }
 
-  // Actually receive the file data
+  // Actually receive the file data this time
   long remain = fsize;
-  char buf[4096];
+
+  // Recieve it in chunks of 4KB just to decrease number of IO operations, like
+  // in clients program
+  char buf[CHUNK];
   while (remain > 0) {
-    long toread = (remain > 4096) ? 4096 : remain;
-    if (recv_all(cfd, buf, toread) < 0) {
+    long toread = (remain > CHUNK) ? CHUNK : remain;
+    if (recv_all(connfd, buf, toread) < 0) {
       printf("[S1] Error receiving file data.\n");
       break;
     }
+
+    // size_t is unsigned int, so better to use it in case of overflow
     size_t written = fwrite(buf, 1, toread, fp);
+    // break if write error
     if (written != (size_t)toread) {
       perror("[S1] fwrite");
       break;
@@ -188,13 +204,15 @@ void uploadf(int cfd, char *filename, char *dest) {
   }
   fclose(fp);
 
-  // 3) Decide if .c => store locally, otherwise forward
+  // Decide which file extension gets stored where
+  // c gets stored in S1
+  // pdf gets stored in S2
+  // txt gets stored in S3
+  // zip gets stored in S4
   const char *ext = get_file_extension(baseName);
   if (strcmp(ext, ".c") == 0) {
-    // *** LOCAL STORAGE IN S1 ***
-
-    // If user typed something like "/hello.c" for `dest`, we want to store it
-    // as "S1/hello.c". If user typed "/some/folder/", we want
+    // If user typed something like "/hello.c" for `dest`, to store it
+    // as "S1/hello.c". If user typed "/some/folder/", store it as
     // "S1/some/folder/<basename>"
 
     // => We'll handle the "auto-append" logic: if `dest` ends with '/' or is
@@ -206,10 +224,8 @@ void uploadf(int cfd, char *filename, char *dest) {
     snprintf(localpath, sizeof(localpath), "S1/%s", dest);
     // localpath might be "S1//hello.c" or "S1//some/folder/"
 
-    // fix double slash: optional step
-    // (not mandatory, but you can do a quick cleanup if you want)
-
-    // If localpath ends with '/', append the baseName
+    // fix double slash
+    // if localpath ends with '/', append the baseName
     size_t dlen = strlen(localpath);
     if (dlen == 0) {
       // edge case
@@ -221,18 +237,18 @@ void uploadf(int cfd, char *filename, char *dest) {
     }
 
     // e.g. if dest="/hello.c", then localpath="S1//hello.c"
-    // That is effectively "S1/hello.c" => good enough
 
-    // 4) separate directory vs. filename
+    // separate directory vs. filename
     char folder[1024];
     strcpy(folder, localpath);
     char *lastSlash = strrchr(folder, '/');
     if (lastSlash) {
       *lastSlash = '\0'; // now folder is just the directory portion
+      // helper function to create directories within servers
       create_dirs_if_needed(folder);
     }
 
-    // 5) rename from tmp to final local path
+    // rename from tmp to final local path
     if (rename(tmp_path, localpath) != 0) {
       perror("[S1] rename failed");
       printf("From: %s\nTo: %s\n", tmp_path, localpath);
@@ -249,10 +265,12 @@ void uploadf(int cfd, char *filename, char *dest) {
       remove(tmp_path);
       return;
     }
+
+    // telling s2 that file is being uploaded so it needs to store the data
     send_string(s2fd, "STORE");
     // S2 expects path + size + data
-    // We'll pass the same 'dest' (like "~S1/folder1"), S2 will interpret
-    // it as "~S2/folder1"
+    // We'll pass the same 'dest' (like "/folder1"), S2 will interpret
+    // it as "/folder1"
     send_string(s2fd, dest);
 
     // find actual size of the tmp file on disk
@@ -261,12 +279,14 @@ void uploadf(int cfd, char *filename, char *dest) {
     long real_size = stt.st_size;
     char stmp[64];
     sprintf(stmp, "%ld", real_size);
+    // send file size to S2
     send_string(s2fd, stmp);
 
+    // send file to S2
     FILE *fpp = fopen(tmp_path, "rb");
     if (fpp) {
       while (!feof(fpp)) {
-        size_t r = fread(buf, 1, 4096, fpp);
+        size_t r = fread(buf, 1, CHUNK, fpp);
         if (r > 0) {
           if (send_all(s2fd, buf, r) < 0) {
             printf("[S1] forward to S2 failed\n");
@@ -281,7 +301,7 @@ void uploadf(int cfd, char *filename, char *dest) {
     remove(tmp_path);
     printf("[S1] .pdf forwarded to S2\n");
   } else if (strcmp(ext, ".txt") == 0) {
-    // Connect to S3, do same approach
+    // Connect to S3, do same thing
     int s3fd = connect_to(S3_HOST, S3_PORT);
     if (s3fd < 0) {
       printf("[S1] Cannot connect S3\n");
@@ -300,7 +320,7 @@ void uploadf(int cfd, char *filename, char *dest) {
     FILE *fpp = fopen(tmp_path, "rb");
     if (fpp) {
       while (!feof(fpp)) {
-        size_t r = fread(buf, 1, 4096, fpp);
+        size_t r = fread(buf, 1, CHUNK, fpp);
         if (r > 0) {
           if (send_all(s3fd, buf, r) < 0) {
             printf("[S1] forward to S3 failed\n");
@@ -314,7 +334,7 @@ void uploadf(int cfd, char *filename, char *dest) {
     remove(tmp_path);
     printf("[S1] .txt forwarded to S3\n");
   } else if (strcmp(ext, ".zip") == 0) {
-    // Connect to S4
+    // Connect to S4, do same thing
     int s4fd = connect_to(S4_HOST, S4_PORT);
     if (s4fd < 0) {
       printf("[S1] Cannot connect S4\n");
@@ -333,7 +353,7 @@ void uploadf(int cfd, char *filename, char *dest) {
     FILE *fpp = fopen(tmp_path, "rb");
     if (fpp) {
       while (!feof(fpp)) {
-        size_t r = fread(buf, 1, 4096, fpp);
+        size_t r = fread(buf, 1, CHUNK, fpp);
         if (r > 0) {
           if (send_all(s4fd, buf, r) < 0) {
             printf("[S1] forward to S4 failed\n");
@@ -354,7 +374,7 @@ void uploadf(int cfd, char *filename, char *dest) {
 }
 
 // 2) downlf
-void downlf(int cfd, char *path) {
+void downlf(int connfd, char *path) {
   const char *ext = get_file_extension(path);
   int remoteSock = -1;
   int localFlag = 0;
@@ -371,33 +391,33 @@ void downlf(int cfd, char *path) {
 
   if (localFlag) {
     // read from S1 folder
-    // e.g. path "~S1/testdir/S1.c" => "S1/testdir/S1.c"
+    // e.g. "S1/testdir/S1.c"
     char localpath[1024];
-    if (strncmp(path, "~S1/", 4) == 0) {
-      snprintf(localpath, sizeof(localpath), "S1/%s", path + 4);
-    } else {
-      snprintf(localpath, sizeof(localpath), "S1/%s", path);
-    }
+    snprintf(localpath, sizeof(localpath), "S1/%s", path);
 
     FILE *fp = fopen(localpath, "rb");
     if (!fp) {
-      // send "0"
-      send_string(cfd, "0");
+      // send "0" for file size, which means file doesn't exist, or there was an
+      // error opening the file
+      send_string(connfd, "0");
       return;
     }
+
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp);
     fseek(fp, 0, SEEK_SET);
 
     char stmp[64];
     sprintf(stmp, "%ld", sz);
-    send_string(cfd, stmp);
+    // send file size
+    send_string(connfd, stmp);
 
-    char buf[4096];
+    char buf[CHUNK];
+    // send file in chunks
     while (!feof(fp)) {
-      size_t r = fread(buf, 1, 4096, fp);
+      size_t r = fread(buf, 1, CHUNK, fp);
       if (r > 0) {
-        if (send_all(cfd, buf, r) < 0) {
+        if (send_all(connfd, buf, r) < 0) {
           printf("[S1] downlf send error\n");
           break;
         }
@@ -407,33 +427,40 @@ void downlf(int cfd, char *path) {
 
   } else {
     // forward to S2, S3, S4
+
+    // exit if there's a socket error
     if (remoteSock < 0) {
-      send_string(cfd, "0");
+      send_string(connfd, "0");
       return;
     }
-    // instruct remote to "GET <path>"
+
+    // telling other servers that file is being downloaded so it needs to get
+    // the data
     send_string(remoteSock, "GET");
     send_string(remoteSock, path);
 
-    // remote sends size
+    // server sends size
     char *sizestr = recv_string(remoteSock);
+
+    // exit if we dont get size
     if (!sizestr) {
       close(remoteSock);
-      send_string(cfd, "0");
+      send_string(connfd, "0");
       return;
     }
+
     // forward size to client
-    send_string(cfd, sizestr);
+    send_string(connfd, sizestr);
     long sz = atol(sizestr);
     free(sizestr);
 
-    // read file data from remote, pass to client
-    char buf[4096];
+    // read file data from server, then send to client
+    char buf[CHUNK];
     while (sz > 0) {
-      long toread = (sz > 4096) ? 4096 : sz;
+      long toread = (sz > CHUNK) ? CHUNK : sz;
       if (recv_all(remoteSock, buf, toread) < 0)
         break;
-      if (send_all(cfd, buf, toread) < 0)
+      if (send_all(connfd, buf, toread) < 0)
         break;
       sz -= toread;
     }
@@ -442,7 +469,7 @@ void downlf(int cfd, char *path) {
 }
 
 // 3) removef
-void removef(int cfd, char *path) {
+void removef(int connfd, char *path) {
   // if .c => remove local. else connect to S2/S3/S4
   const char *ext = get_file_extension(path);
   if (strcmp(ext, ".c") == 0) {
@@ -475,34 +502,38 @@ void removef(int cfd, char *path) {
       close(s4fd);
     }
   } else {
-    // ignore or handle unknown ext
+    printf("Unsupported file format!\n");
+    return;
   }
 }
 
-// 4) downltar
-void downltar(int cfd, char *filetype) {
-  char buf[4096];
+// downltar
+void downltar(int connfd, char *filetype) {
+  char buf[CHUNK];
   if (strcmp(filetype, ".c") == 0) {
+    // remove tar file if it already exists
     system("rm -f cfiles.tar");
-    system("tar -cf cfiles.tar S1"); // naive
+    // create new tar file of S1 folder, since it only contains .c files
+    system("tar -cf cfiles.tar S1");
     // send cfiles.tar
     FILE *fp = fopen("cfiles.tar", "rb");
     if (!fp) {
-      send_string(cfd, "0");
+      send_string(connfd, "0");
       return;
     }
+
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp);
     fseek(fp, 0, SEEK_SET);
 
     char stmp[64];
     sprintf(stmp, "%ld", sz);
-    send_string(cfd, stmp);
+    send_string(connfd, stmp);
 
     while (!feof(fp)) {
-      size_t r = fread(buf, 1, 4096, fp);
+      size_t r = fread(buf, 1, CHUNK, fp);
       if (r > 0) {
-        if (send_all(cfd, buf, r) < 0) {
+        if (send_all(connfd, buf, r) < 0) {
           printf("[S1] downltar .c send error\n");
           break;
         }
@@ -510,98 +541,101 @@ void downltar(int cfd, char *filetype) {
     }
     fclose(fp);
   } else if (strcmp(filetype, ".pdf") == 0) {
-    // forward to S2 -> "TAR"
+    // send instruction to S2 for creating tar, get the file and send it back to
+    // client
     int s2fd = connect_to(S2_HOST, S2_PORT);
     if (s2fd < 0) {
-      send_string(cfd, "0");
+      send_string(connfd, "0");
       return;
     }
     send_string(s2fd, "TAR");
     char *sizestr = recv_string(s2fd);
     if (!sizestr) {
       close(s2fd);
-      send_string(cfd, "0");
+      send_string(connfd, "0");
       return;
     }
     // forward size to client
-    send_string(cfd, sizestr);
+    send_string(connfd, sizestr);
     long sz = atol(sizestr);
     free(sizestr);
 
     while (sz > 0) {
-      long toread = (sz > 4096) ? 4096 : sz;
+      long toread = (sz > CHUNK) ? CHUNK : sz;
       if (recv_all(s2fd, buf, toread) < 0)
         break;
-      if (send_all(cfd, buf, toread) < 0)
+      if (send_all(connfd, buf, toread) < 0)
         break;
       sz -= toread;
     }
     close(s2fd);
   } else if (strcmp(filetype, ".txt") == 0) {
-    // forward to S3
+    // send instruction to S3 for creating tar, get the file and send it back to
+    // client
     int s3fd = connect_to(S3_HOST, S3_PORT);
     if (s3fd < 0) {
-      send_string(cfd, "0");
+      send_string(connfd, "0");
       return;
     }
     send_string(s3fd, "TAR");
     char *sizestr = recv_string(s3fd);
     if (!sizestr) {
       close(s3fd);
-      send_string(cfd, "0");
+      send_string(connfd, "0");
       return;
     }
-    send_string(cfd, sizestr);
+    send_string(connfd, sizestr);
     long sz = atol(sizestr);
     free(sizestr);
 
     while (sz > 0) {
-      long toread = (sz > 4096) ? 4096 : sz;
+      long toread = (sz > CHUNK) ? CHUNK : sz;
       if (recv_all(s3fd, buf, toread) < 0)
         break;
-      if (send_all(cfd, buf, toread) < 0)
+      if (send_all(connfd, buf, toread) < 0)
         break;
       sz -= toread;
     }
     close(s3fd);
   } else {
-    // .zip? Not in the original specs for downltar
-    send_string(cfd, "0");
+    // send 0 indicating unsupported file type
+    send_string(connfd, "0");
   }
 }
 
 // 5) dispfnames
-void dispfnames(int cfd, char *path) {
+void dispfnames(int connfd, char *path) {
   // gather .c from local S1 folder, .pdf from S2, .txt from S3, .zip from S4
   // then combine in alphabetical order.
   // We'll do a simplistic approach: gather each list separately, then combine.
   // local .c:
   char localp[1024];
-  if (strncmp(path, "~S1/", 4) == 0) {
-    snprintf(localp, sizeof(localp), "S1/%s", path + 4);
-  } else {
-    snprintf(localp, sizeof(localp), "S1/%s", path);
-  }
+  snprintf(localp, sizeof(localp), "S1/%s", path);
+
   DIR *d = opendir(localp);
   char result[8192];
   memset(result, 0, sizeof(result));
+  // if directory exists
   if (d) {
     // gather .c
+    // dirent structs contain information about files in a directory
     struct dirent *dd;
     // store them in a temporary array to sort
+    // first dimension is for file count, second, is to store the filename
     char lines[256][256];
     int count = 0;
+    // loop through directory, get .c files and add them to lines array
     while ((dd = readdir(d))) {
-      if (dd->d_name[0] == '.')
-        continue;
       if (strstr(dd->d_name, ".c")) {
         strncpy(lines[count], dd->d_name, 255);
         lines[count][255] = 0;
         count++;
+      } else {
+        continue;
       }
     }
     closedir(d);
-    // sort lines
+    // bubble sort lines
     for (int i = 0; i < count; i++) {
       for (int j = i + 1; j < count; j++) {
         if (strcmp(lines[i], lines[j]) > 0) {
@@ -612,6 +646,8 @@ void dispfnames(int cfd, char *path) {
         }
       }
     }
+
+    // append to result
     for (int i = 0; i < count; i++) {
       strcat(result, lines[i]);
       strcat(result, "\n");
@@ -619,16 +655,16 @@ void dispfnames(int cfd, char *path) {
   }
 
   // gather from S2 => .pdf
-  // We'll just ask for "LIST path"
-  // connect
   int s2fd = connect_to(S2_HOST, S2_PORT);
   if (s2fd >= 0) {
+    // LIST tells server that client has entered dispfnames and
+    // needs the list of files in a directory
     send_string(s2fd, "LIST");
     send_string(s2fd, path);
     char *pdfs = recv_string(s2fd);
     if (pdfs) {
       // pdfs is new-line separated
-      // we want them sorted. Let's do a quick approach:
+      // sort pdf files same way as c files
       char lines[256][256];
       int count = 0;
       char *tok = strtok(pdfs, "\n");
@@ -638,7 +674,7 @@ void dispfnames(int cfd, char *path) {
         count++;
         tok = strtok(NULL, "\n");
       }
-      // sort
+      // bubble sort
       for (int i = 0; i < count; i++) {
         for (int j = i + 1; j < count; j++) {
           if (strcmp(lines[i], lines[j]) > 0) {
@@ -649,7 +685,7 @@ void dispfnames(int cfd, char *path) {
           }
         }
       }
-      // append
+      // append to result
       for (int i = 0; i < count; i++) {
         strcat(result, lines[i]);
         strcat(result, "\n");
@@ -659,7 +695,7 @@ void dispfnames(int cfd, char *path) {
     close(s2fd);
   }
 
-  // gather from S3 => .txt similarly
+  // gather .txt files from S3 in the same way
   int s3fd = connect_to(S3_HOST, S3_PORT);
   if (s3fd >= 0) {
     send_string(s3fd, "LIST");
@@ -694,7 +730,7 @@ void dispfnames(int cfd, char *path) {
     close(s3fd);
   }
 
-  // gather from S4 => .zip
+  // gather .zip files from S3 in the same way
   int s4fd = connect_to(S4_HOST, S4_PORT);
   if (s4fd >= 0) {
     send_string(s4fd, "LIST");
@@ -730,22 +766,23 @@ void dispfnames(int cfd, char *path) {
   }
 
   // now send result to client
-  send_string(cfd, result);
+  send_string(connfd, result);
 }
 
-// connect_to helper
+// whole process needed to connect to other servers, which is why it is
+// extracted to a function
 int connect_to(const char *host, int port) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0)
     return -1;
 
-  struct sockaddr_in saddr;
-  memset(&saddr, 0, sizeof(saddr));
-  saddr.sin_family = AF_INET;
-  saddr.sin_port = htons(port);
-  inet_pton(AF_INET, host, &saddr.sin_addr);
+  struct sockaddr_in servAdd;
+  memset(&servAdd, 0, sizeof(servAdd));
+  servAdd.sin_family = AF_INET;
+  servAdd.sin_port = htons(port);
+  inet_pton(AF_INET, host, &servAdd.sin_addr);
 
-  if (connect(fd, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
+  if (connect(fd, (struct sockaddr *)&servAdd, sizeof(servAdd)) < 0) {
     close(fd);
     return -1;
   }

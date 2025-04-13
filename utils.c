@@ -15,13 +15,20 @@
 
 // Simple send/recv wrapper for fixed-length messages
 // Returns 0 on success, or -1 on error/EOF
+// send/recv are specifically designed for sockets, whereas read/write
+// is for general use case. send recv provide better eror contexts
+// since we're using send and recv, we need to send byte by byte, since there
+// might be data loss
 int send_all(int sock, const void *buf, size_t len) {
   size_t total = 0;
   const char *p = (const char *)buf;
   while (total < len) {
     ssize_t sent = send(sock, p + total, len - total, 0);
-    if (sent <= 0)
+    if (sent <= 0) {
+      perror("send error");
+
       return -1;
+    }
     total += sent;
   }
   return 0;
@@ -33,8 +40,11 @@ int recv_all(int sock, void *buf, size_t len) {
   char *p = (char *)buf;
   while (total < len) {
     ssize_t got = recv(sock, p + total, len - total, 0);
-    if (got <= 0)
+    if (got <= 0) {
+      perror("recv error");
+
       return -1;
+    }
     total += got;
   }
   return 0;
@@ -57,6 +67,7 @@ char *recv_string(int sock) {
   if (recv_all(sock, &length, 4) < 0)
     return NULL;
   length = ntohl(length);
+  // calloc initializes memory space with 0s to avoid existing garbage data
   char *buf = (char *)calloc(length + 1, 1);
   if (length > 0) {
     if (recv_all(sock, buf, length) < 0) {
@@ -72,6 +83,7 @@ void create_dirs_if_needed(const char *path) {
   strncpy(temp, path, sizeof(temp) - 1);
   temp[sizeof(temp) - 1] = '\0';
 
+  // loop through provided path and tokenizes folder names through /
   char build[1024] = "";
   char *p = strtok(temp, "/");
 
